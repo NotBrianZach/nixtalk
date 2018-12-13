@@ -1,0 +1,932 @@
+* What is nix?
+Much like the fundamental theorem of physics seeks to unite
+the fundamental forces of gravity, electromagnetism, and the strong
+and weak nuclear forces inside a single theoretical framework,
+nix seeks to unite configuration and package management.
+
+nix/nix-shell/nix-build -> 
+  replaces:
+  apt-get, homebrew, etc.
+  a lot (most?) of what people use docker for
+  
+nixos (aka the modules system) ->
+  replaces other linux distributions
+  
+nixops ->
+  replaces stuff like ansible, puppet, chef
+  (apparently, can be used as a nixops replacement, with a little elbow grease)
+  
+hydra ->
+  continuous integration system, replaces jenkins
+  word on the street is it's awesome, but at the 
+  same time complex to configure and has trouble with statefulness
+
+
+* Examples?
+** nix-shell
+   Simple example
+  #+BEGIN_SRC nix
+     with import <nixpkgs> {};
+     # with luajitPackages;
+     with luaPackages; 
+
+     let
+       libs = [lua luasocket luaffi cjson];
+     in
+     stdenv.mkDerivation rec {
+       name = "lua-env";
+       buildInputs = libs;
+
+       shellHook = ''
+         export LUA_CPATH="${lib.concatStringsSep ";" (map getLuaCPath libs)}"
+         export LUA_PATH="${lib.concatStringsSep ";" (map getLuaPath libs)}"
+       '';
+     }
+   #+END_SRC
+   
+   Complex example
+  #+BEGIN_SRC nix
+# if you want to re use release.nix and be able to deploy to hydra, will need to use this
+# (import ./release.nix).manage.env
+# import ./release.nix
+
+# (how nixpkgs.json was generated) nix-prefetch-git https://github.com/NixOS/nixpkgs.git f5689d5d6b9be626e8528cb63e2f2cf8f9a0c87e > nixpkgs.json
+    { compiler ? "ghc843",
+     withHoogle ? true
+    }:
+
+    let
+     # we need custom versions of some haskell libraries in order to build our manage binary
+      dontCheckPackages = [
+        "hasql"
+      ];
+      # Jailbreak these packages
+      doJailbreakPackages = [
+       # "aeson"
+      ];
+      # Disable haddocks for these packages
+      dontHaddockPackages = [
+      ];
+      config = {
+        allowUnfree = true;
+        packageOverrides = pkgs: rec {
+          haskellPackages =
+            let
+              generatedOverrides = haskellPackagesNew: haskellPackagesOld:
+                let
+                  toPackage = file: _: {
+                    name  = builtins.replaceStrings [ ".nix" ] [ "" ] file;
+
+                    value = haskellPackagesNew.callPackage (./. + "/nix/${file}") { };
+                  };
+                in
+                  pkgs.lib.mapAttrs' toPackage (builtins.readDir ./nix);
+
+              makeOverrides =
+                function: names: haskellPackagesNew: haskellPackagesOld:
+                  let
+                    toPackage = name: {
+                      inherit name;
+                      value = function haskellPackagesOld.${name};
+                    };
+
+                in
+                  builtins.listToAttrs (map toPackage names);
+
+              composeExtensionsList =
+                pkgs.lib.fold pkgs.lib.composeExtensions (_: _: {});
+
+              # More exotic overrides go here
+              manualOverrides = haskellPackagesNew: haskellPackagesOld: {
+              };
+            in
+              pkgs.haskellPackages.override {
+                overrides = composeExtensionsList [
+                  generatedOverrides
+                  (makeOverrides pkgs.haskell.lib.dontCheck   dontCheckPackages  )
+                  (makeOverrides pkgs.haskell.lib.doJailbreak doJailbreakPackages)
+                  (makeOverrides pkgs.haskell.lib.dontHaddock dontHaddockPackages)
+                  manualOverrides
+                ];
+              };
+        };
+      };
+      bootstrap = import <nixpkgs> {};
+      nixpkgs = builtins.fromJSON (builtins.readFile ./nixpkgs.json);
+      src = bootstrap.fetchFromGitHub {
+        owner = "NixOS";
+        repo  = "nixpkgs";
+        inherit (nixpkgs) rev sha256;
+      };
+      pkgs = import src { inherit config; };
+
+      f = import ./manage.nix;
+      packageSet = pkgs.haskell.packages.${compiler};
+      hspkgs = (
+        # hoogle server --local -p 8080 &> /tmp/hoogle.log & disown
+        if withHoogle then
+          packageSet.override {
+            overrides = (self: super: {
+              ghc = super.ghc // { withPackages = super.ghc.withHoogle; };
+              ghcWithPackages = self.ghc.withPackages;
+            });
+          }
+          else packageSet
+      );
+      drv = hspkgs.callPackage f {};
+
+      # tempPkgsWithNewerRubyTools = import (fetchTarball
+      #   "https://github.com/NixOS/nixpkgs-channels/archive/45a419ab5a23c93421c18f3d9cde015ded22e712.tar.gz"
+      # ) { inherit config; };
+    in
+      if pkgs.lib.inNixShell then
+        pkgs.mkShell {
+          inputsFrom = [drv.env];
+          buildInputs = [
+            # tempPkgsWithNewerRubyTools.sqlint
+          ];
+          shellHook = ''hoogle server --local -p 8080 &> /tmp/hoogle.log & disown'';
+        }
+      else drv
+  #+END_SRC
+   
+** nixos (aka nixos modules system)
+   https://github.com/NixOS/nixpkgs/blob/master/lib/modules.nix
+   throws out fhs, lots of what went into /bin and /etc go into /nix/store instead
+   
+  Example nixos module/daemon
+  #+BEGIN_SRC nix
+    { config, lib, pkgs, ... }:
+
+    with lib;
+
+    let
+      cfg = config.services.customPostgrest;
+    in {
+      ###### interface
+      options = {
+        services.customPostgrest = {
+          db-uri = mkOption {
+            default = "postgres:///postgres";
+            description = ''
+             The standard connection URI format, documented at
+             https://www.postgresql.org/docs/current/static/libpq-connect.html#AEN45347
+             not using username/port in default, assumes localhost and avoids asking for password
+            '';
+            type = types.string;
+          };
+
+          db-schema = mkOption {
+            default = "public";
+            description = ''
+             The name of which database schema to expose to REST clients
+            '';
+            type = types.string;
+          };
+
+          db-anon-role = mkOption {
+            default = "anon";
+            description = ''
+             The database role to use when no client authentication is provided.
+             Can (and probably should) differ from user in db-uri
+            '';
+            type = types.string;
+          };
+
+          db-pool = mkOption {
+            default = 10;
+            description = ''
+             Number of connections to keep open in PostgREST’s database pool. Having enough here for the maximum expected simultaneous client connections can improve performance. Note it’s pointless to set this higher than the max_connections GUC in your database.
+            '';
+            type = types.ints.positive;
+          };
+
+          server-host = mkOption {
+            default = "127.0.0.1";
+            description = ''
+             Where to bind the PostgREST web server.
+            '';
+            type = types.string;
+          };
+
+          server-proxy-uri = mkOption {
+            default = "";
+            description = '' Overrides the base URL used within the OpenAPI self-documentation hosted at the API root path. Use a complete URI syntax scheme:[//[user:password@]host[:port]][/]path[?query][#fragment]. Ex. https://postgrest.com
+    {
+      "swagger": "2.0",
+      "info": {
+        "version": "0.4.0.0",
+        "title": "PostgREST API",
+        "description": "This is a dynamic API generated by PostgREST"
+      },
+      "host": "postgrest.com:443",
+      "basePath": "/",
+      "schemes": [
+        "https"
+      ]
+    }
+            '';
+            type = types.string;
+          };
+
+          jwt-secret-file = mkOption {
+            default = postgrest-jwt-secret;
+            description = ''
+             Path to the file that contains the secret used to decode JWT tokens clients provide for authentication. If this parameter is not specified then PostgREST refuses authentication requests. Choosing a value for this parameter beginning with the at sign such as @filename loads the secret out of an external file. This is useful for automating deployments. Note that any binary secrets must be base64 encoded.
+            '';
+            type = types.path;
+          };
+
+          secret-is-base64 = mkOption {
+            default = false;
+            description = ''
+             When this is set to true, the value derived from jwt-secret will be treated as a base64 encoded secret.
+            '';
+            type = types.bool;
+          };
+
+          max-rows = mkOption {
+            default = 200;
+            description = ''
+               A hard limit to the number of rows PostgREST will fetch from a view, table, or stored procedure. Limits payload size for accidental or malicious requests.
+            '';
+            type = types.ints.positive;
+          };
+
+          pre-request = mkOption {
+            default = "";
+            description = ''
+              A schema-qualified stored procedure name to call right after switching roles for a client request. This provides an opportunity to modify SQL variables or raise an exception to prevent the request from completing.
+            '';
+            type = types.str;
+          };
+
+          enable = mkOption {
+            default = false;
+            description = ''
+              Whether to enable the RabbitMQ server, an Advanced Message
+              Queuing Protocol (AMQP) broker.
+            '';
+          };
+
+          server-port = mkOption {
+            default = 3030;
+            description = ''
+             The port to bind the web server.
+            '';
+            type = types.ints.positive;
+          };
+
+          overridePostgrestServer = mkOption {
+            type = types.path;
+            default = pkgs.rabbitmq_server;
+            description = ''
+              Allows to pass custom version rabbitmq to service, defaults to pkgs version.
+            '';
+          };
+        };
+      };
+
+
+      ###### implementation
+      config = mkIf cfg.enable {
+
+        environment.systemPackages = [ cfg.overridePostgrestServer ];
+
+        users.extraUsers.postgrest = {
+          description = "Postgrest server user";
+          # home = "${cfg.dataDir}";
+          # createHome = true;
+          group = "postgrest";
+          # uid = config.ids.uids.rabbitmq;
+        };
+
+        # users.extraGroups.rabbitmq.gid = config.ids.gids.rabbitmq;
+
+        systemd.services.customPostgrest = {
+          description = "Postgrest Server";
+
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network.target" ];
+
+          path = [ cfg.overridePostgrestServer ];
+
+          serviceConfig = {
+            # to enable firehose logging, rabbitmqctl trace_on
+            ExecStart = "${cfg.overridePostgrest}/bin/postgrest /run/postgrest/postgrest.config";
+            User = "postgrest";
+            Group = "postgrest";
+          };
+
+          preStart = ''
+          cat > /run/postgrest/postgrest.config << EOF
+          db-uri = ${cfg.db-uri}
+          db-schema = ${cfg.db-schema}
+          db-anon-role = ${cfg.db-anon-role}
+          db-pool = ${cfg.db-pool}
+          server-port = ${cfg.server-port}
+          jwt-secret = $(cat "${cfg.jwt-secret-file}")
+          max-rows = ${cfg.max-rows}
+          secret-is-base64 = ${cfg.secret-is-base64}
+          pre-request = ${cfg.pre-request}
+          EOF
+          if [ ! ${cfg.server-proxy-uri} = "" ]; then
+            cat >> /run/postgrest/postgrest.config << EOF
+            server.proxy.uri = ${cfg.server-proxy-uri}
+            EOF
+          fi
+          '';
+        };
+
+      };
+      }
+  #+END_SRC
+  
+  Example nixos config
+  #+BEGIN_SRC nix
+  # { config, lib, pkgs, ... }:
+{ config, lib, ... }:
+# Edit this configuration file to define what should be installed on
+# your system.  Help is available in the configuration.nix(5) man page
+# and in the NixOS manual (accessible by running ‘nixos-help’).
+with lib;
+let
+  channel = "nixos-18.09";
+  sysPkgs = import <nixpkgs> {};
+  config.allowUnfree = true;
+
+  # Use `runCommand` to grab the SHA of the latest build of the channel. This
+  # ensures that the `nixpkgs` set we end up with has already passed through
+  # Hydra and therefore has passed its tests and has a binary cache available.
+  latestRevision = import (sysPkgs.runCommand "latestRevision"
+    { buildInputs = [ sysPkgs.wget ];
+      # Force the input to be different each time or else Nix won't check for
+      # updates to the channel next time we evaluate this expression
+      dummy = builtins.currentTime;
+    }
+    ''
+      SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
+      # nixos.org/channels/$channel always points to the latest released
+      # revision of the channel, which contains a file with its git SHA. Once we
+      # have it, we have to wrap it in quotes so it will become a string when we
+      # `import` $out
+      wget -O - https://nixos.org/channels/${channel}/git-revision |\
+        sed 's#\(.*\)#"\1"#' > $out
+    '');
+
+  pkgs = import (fetchTarball
+    "https://github.com/NixOS/nixpkgs-channels/archive/${latestRevision}.tar.gz"
+  ) { inherit config; overlays =
+    [ (self: super:
+      {
+        # Potential Issues
+        # https://github.com/NixOS/nixpkgs/issues/25264
+        # Be aware that we need a nix-collect-garbage to fetch the most current version
+
+        # How To do:
+        # # override with newer version from nixpkgs-unstable
+        # qemu = unstable.qemu;
+
+        # # custom package that depends on hello from nixpkgs-unstable
+        # foo = self.callPackage ./pkgs/foo { inherit (unstable) hello; };
+        customPostgrest = self.callPackage ./customNixPkgs/postgrest/default.nix {};
+        customOpenresty = self.callPackage ./customNixPkgs/customOpenresty.nix {  };
+      })
+    ];
+   };
+
+  # nixpkgs.overlays =
+  #   [ (self: super:
+  #     {
+  #       # # override with newer version from nixpkgs-unstable
+  #       # qemu = unstable.qemu;
+
+  #       # # custom package that depends on hello from nixpkgs-unstable
+  #       # foo = self.callPackage ./pkgs/foo { inherit (unstable) hello; };
+  #       customOpenresty = self.callPackage ./pkgs/openresty {};
+  #     })
+  #   ];
+
+  # frozenUnstablePackages = import (sysPkgs.fetchFromGitHub {
+
+  # frozenUnstablePackages = import (sysPkgs.fetchgit {
+  #   # owner = "octocat";
+  #   url = "https://github.com/NixOS/nixpkgs";
+  #   rev = "2fce8dda39c1877acf02b018ae3513ad5014f706";
+  #   # repo = ;
+  #   sha256 = "0ranz49901a0q2l7ii32yvn1khcy2a5ibmzp23bdz1bpv5s3224s";
+  #   # "date" = "2017-02-14T00:47:26+01:00";
+  # }) {};
+  # overrideNixops = import frozenUnstablePackages.nixops;
+
+  luaPkgs = [pkgs.luajitPackages.lua pkgs.luajitPackages.luasocket pkgs.luaffi];
+
+  # otherpkgs has rabbitmq v6.6 which will hopefully fix websocket issues from
+  # rabbit 5.6 (web_stomp plugin was re written since 5.6)
+  otherPkgs = import (fetchTarball
+    "https://github.com/NixOS/nixpkgs-channels/archive/a7c8f5e419ba07711c132bf81baaab0e74862cce.tar.gz"
+  ) { inherit config; };
+
+
+  # customWebstompPlugin = sysPkgs.beamPackages.callPackage (import ./customRabbitWebstompClient.nix) {};
+  customWebstompPlugin = ./customNixPkgs/rabbitCustomWebstompPlugin;
+
+  customRabbitServer = sysPkgs.callPackage (import ./customNixPkgs/customRabbitPackage.nix) { inherit customWebstompPlugin; inherit (sysPkgs.darwin.apple_sdk.frameworks) AppKit Carbon Cocoa; };
+  nixpkgs.config.packageOverrides = pkgs: rec {
+
+    emacs = pkgs.emacs.overrideDerivation (args: rec {
+      withGTK3 = true;
+      withGTK2 = false;
+      pythonPath = [];
+      buildInputs = with pkgs; (args.buildInputs ++
+      [
+        makeWrapper
+        python
+        python27Packages.setuptools
+        python27Packages.pip
+        python27Packages.ipython
+        python27Packages.numpy
+      ]);
+
+      postInstall = with pkgs.python27Packages; (args.postInstall + ''
+      echo "This is PYTHONPATH: " $PYTHONPATH
+      wrapProgram $out/bin/emacs \
+      --prefix PYTHONPATH : "$(toPythonPath ${python}):$(toPythonPath ${ipython}):$(toPythonPath ${setuptools}):$(toPythonPath ${pip}):$(toPythonPath ${numpy}):$PYTHONPATH";
+      '');
+    });
+  };
+in
+{
+  # overrides module option value...
+  # config = {
+  #   # systemd.services.hydra-init = {...}: {
+  #   #   options = {
+  #   #      preStart = lib.mkOption {
+  #   #        apply = str: builtins.concatStringsSep "" [ str "hi" ];
+  #   #      };
+  #   #   };
+  #     # config = {};
+  #   };
+  # };
+
+  # if builtins.pathExists "~/dotfiles/perosonal.nix" then
+  #   imports = [ # Include the results of the hardware scan.
+  #     ./hardware-configuration.nix
+  #     # Include customModules
+  #     ./customNixosModules/customPostgrest.nix
+  #     ./customNixosModules/customRabbitMQ.nix
+  #   ];
+  # else
+
+    # imports = let path = ../overlays; in with builtins;
+    #   map (n: import (path + ("/" + n)))
+    #       (filter (n: match ".*\\.nix" n != null ||
+    #                   pathExists (path + ("/" + n + "/default.nix")))
+    #               (attrNames (readDir path)));
+
+     # Include the results of the hardware scan.
+     # if builtins.pathExists "~/dotfiles/perosonal.nix" then
+     # else
+    imports = [
+      ./hardware-configuration.nix
+      # Include customModules
+      ./customNixosModules/customPostgrest.nix
+      ./customNixosModules/customRabbitMQ.nix
+      # ./customNixosModules/customHttpd.nix
+    ];
+
+  # to use hdmi port: step 1: shut down computer
+  # step 2: plug in hdmi cable
+  # step 3: power on computer
+  # step 4: sudo intel-virtual-output
+  # step 5: xrandr --auto
+  # step 6: done, hopefully
+  hardware.bumblebee.enable = true;
+  hardware.bumblebee.connectDisplay = true;
+
+
+
+  boot.loader.systemd-boot.enable = true;
+  boot.loader.efi.canTouchEfiVariables = true;
+  # Use the GRUB 2 boot loader.
+  # boot.loader.grub.enable = true;
+  # boot.loader.grub.version = 2;
+  # boot.loader.grub.efiSupport = true;
+  # boot.loader.grub.efiInstallAsRemovable = true;
+  boot.loader.efi.efiSysMountPoint = "/boot/efi";
+  # Define on which hard drive you want to install Grub.
+  boot.loader.grub.device = "nodev"; # or "nodev" for efi only
+
+  # nix.nixPath = [
+  #   "nixpkgs=https://nixos.org/channels/nixos-17.03/nixexprs.tar.xz"
+  #   "nixos-config=/etc/nixos/configuration.nix"
+  #   "knedlsepp-overlays=https://github.com/knedlsepp/nixpkgs-overlays/archive/master.tar.gz"
+  # ];
+  environment.variables."SSL_CERT_FILE" = "/etc/ssl/certs/ca-bundle.crt";
+
+  environment.variables."LUA_PATH" = ''${concatStringsSep ";" (map pkgs.luajitPackages.getLuaPath luaPkgs)}'';
+  environment.variables."LUA_CPATH" = ''${concatStringsSep ";" (map pkgs.luajitPackages.getLuaPath luaPkgs)}'';
+
+  networking = {
+    # wireless.enable = true;     # Enables wireless support via wpa_supplicant.
+    networkmanager.enable = true; # Enable NetworkManager
+    hostName = "zachMothership"; # Define your hostname.
+    extraHosts = "
+      127.0.0.1 dev.localhost.com
+      127.0.0.1 zachMothership
+      127.0.0.1 seekingalpha.com
+      127.0.0.1 grimtools.com
+      127.0.0.1 nyt.com
+      127.0.0.1 arstechnica.com
+      127.0.0.1 finance.google.com
+      127.0.0.1 facebook.com
+      127.0.0.1 fb.com
+      127.0.0.1 news.ycombinator.com
+    ";
+    # extraHosts = "
+    #   127.0.0.1 zachMothership
+    #   192.168.122.2 apiServer
+    #   192.168.122.3 postgresqlServer
+    #   192.168.122.4 rabbitServer
+    # ";
+    # wireless.enable = lib.mkForce true;  # Not compatible with gnome, Enables wireless support via wpa_supplicant.
+    firewall.checkReversePath = false;
+    firewall.enable = true;
+    # 5672 = rabbitmq amqp port, 15674 = rabbitmq stomp (web browser communication) port (also 61613 and 61614)
+    # 5672+20000 = additional rabbitmq port to open for cli tool to work
+    # https://www.rabbitmq.com/html also ports for stomp, websockets, etc.
+    firewall.allowedTCPPorts = [ 80 8080 4369 3000 3001 3030 443 5672 25672 15674 61613 61614 22 3333 5238 4444 5432 ];
+  };
+
+  programs.ssh.extraConfig = "";
+
+  # start ssh-agent at startup
+  programs.ssh.startAgent = true;
+
+  # Select internationalisation properties.
+  i18n = {
+    consoleFont = "Lat2-Terminus16";
+    consoleKeyMap = "us";
+    defaultLocale = "en_US.UTF-8";
+  };
+
+  # Set your time zone.
+  time.timeZone = "America/Chicago";
+
+
+  # List packages installed in system profile. To search by name, run:
+  # $ nix-env -qaP | grep wget
+
+  environment.systemPackages = with pkgs; [
+    anki
+
+    # https://thisissavo.github.io/programming/2017/01/31/jekyll-setup-in-nixos.html
+    jekyll
+    gitAndTools.gitFull
+    bundler
+    bundix
+
+    # use this to get battery info for taffybar (or just to print out yourself)
+    acpi
+    # npm2nix
+    # stack
+    # system documenation
+    bash
+    # temporary trouble dl'ing from binary cache
+    # blender
+    cabal-install
+    cabal2nix
+    calibre
+    # cargo
+    chromium
+    coreutils
+    direnv
+    djview
+    dnsmasq
+    docker
+    elasticsearch
+    erlang
+    # epdfview
+    # elixir
+    emacs
+    # firefox
+    file
+    # gcc
+    git
+    gnumake
+    gnupg
+    gparted
+    jq
+    lynx
+    customRabbitServer
+    # for emacs spell checking
+    ispell
+    otherPkgs.elixir
+    nix-prefetch-scripts
+    nodejs-8_x
+    # npm2nix
+    # openresty
+    customOpenresty
+
+    openssl
+    # overrideGhc
+    #  used to patch elf files/executables for nixos paths,
+    # for programs not compiled on nixos
+    patchelf
+    perlPackages.IOPager
+    pinfo
+    postgresql
+    privoxy
+    psqlodbc
+    python27
+    python27Packages.digital-ocean
+    python27Packages.ipython
+    python27Packages.numpy
+    python27Packages.pip
+    python27Packages.setuptools
+
+    # command line helpers for rabbitmq
+    rabbitmq-c
+    ruby
+
+    # redis
+
+    # rebar/rebar3 used when building rabbitmq from source
+    # rebar # deprecated in favor of rebar3
+    rebar3
+
+    # can't remeber what this is used for?
+    # rustc # need at least 1.17 not to get build errors
+
+    silver-searcher
+    sqitchPg
+    sqlite
+    sshfsFuse
+    tcpdump
+    trash-cli
+
+    vim
+    virtmanager
+    vlc
+
+    wget
+    # build error
+    # wireshark-gtk
+    youtube-dl
+
+    # needed for building rabbitmq plugins
+    zip
+    # needed for postgrest executable
+    zlib
+
+
+    # graphical libshttps://github.com/Ericson2314/nixos-configuration/blob/nixos/graphical.nix
+    # Desktop Env
+    dmenu
+    taffybar
+
+    # Bits of Gnome
+    # gnome3.gnome_terminal
+    evince
+
+    # Terminal emulator
+    termite
+
+    # change screen brightness programmatically (used in xmonad config)
+    xorg.xbacklight
+
+    # https://superuser.com/questions/389737/how-do-you-make-volume-keys-and-mute-key-work-in-xmonad
+    xorg.xev
+  ];
+
+  fonts = {
+    enableFontDir = true;
+    enableGhostscriptFonts = true;
+    fonts = with pkgs; [
+      anonymousPro
+      corefonts
+      dejavu_fonts
+      font-droid
+      freefont_ttf
+      google-fonts
+      inconsolata
+      liberation_ttf
+      powerline-fonts
+      source-code-pro
+      terminus_font
+      ttf_bitstream_vera
+      ubuntu_font_family
+    ];
+  };
+
+  security.sudo.enable = true;
+  security.sudo.configFile = ''
+    # Environment variables to keep for root and %wheel.
+    Defaults:root,%wheel env_keep+=TERMINFO_DIRS
+    Defaults:root,%wheel env_keep+=TERMINFO
+
+    # Keep SSH_AUTH_SOCK so that pam_ssh_agent_auth.so can do its magic.
+    Defaults env_keep+=SSH_AUTH_SOCK
+
+    # "root" is allowed to do anything. And zach is awesome (and also really insecure).
+    root        ALL=(ALL) SETENV: ALL
+    zach        ALL=(ALL) SETENV: ALL
+
+    # Users in the "wheel" group can do anything.
+    %wheel      ALL=(ALL:ALL) SETENV: ALL
+   '';
+
+  # removed for intercepting emacs requests to search google
+  # https://nixos.org/nixos/manual/options.html#opt-programs.spacefm.settings
+  # programs.spacefm.enable = true;
+
+  systemd.targets."multi-user".conflicts = [ "getty@tty1.service" ];
+
+  services = {
+    # thinkfan.enable = true;
+
+    # dnsmasq = {
+    #   enable = true;
+    #   resolveLocalQueries = true;
+    #   # extraconfig = '''';
+    # };
+
+    # Enable the OpenSSH daemon.
+    openssh.enable = true;
+
+    redis.enable = true;
+    postgresql.enable = true;
+    # postgresql.identMap = ''
+    #   zachmap         zach               root
+    #   zachmap         root               root
+    # '';
+    postgresql.initialScript = "/etc/nixos/postgresInitScript.sql";
+    postgresql.authentication = ''
+        # Generated file; do not edit!
+        # local all all              ident map=zachmap
+        local mediawiki mediawiki ident map=mwusers
+        local all all              ident
+        host  all all 127.0.0.1/32 md5
+        host  all all ::1/128      md5
+      '';
+    postgresql.identMap = ''
+      mwusers root   mediawiki
+      mwusers wwwrun mediawiki
+    '';
+    httpd = {
+        enable = true;
+        extraSubservices = singleton
+          {
+            serviceType = "mediawiki";
+            # siteName = "Example Wiki";
+            # dbUser = "postgres";
+            skins = [];
+            defaultSkin = "vector";
+            dbName = "mediawiki";
+            extraConfig = ''
+              wfLoadSkin( 'CologneBlue' );
+              wfLoadSkin( 'Modern' );
+              wfLoadSkin( 'MonoBook' );
+              wfLoadSkin( 'Vector' );
+            '';
+          };
+      };
+    # mediawiki = {
+    #   enable = true;
+    #   dbUser = "zach";
+    #   dbName = "mediawiki";
+    # };
+    # Enable CUPS to print documents. Just use flash drive.
+    # printing.enable = true;
+    # printing.drivers = [ hplip ];
+
+    customRabbitMQ = {
+    #  THE BELOW IS NECESSARY
+  # networking.extraHosts = "
+  #   127.0.0.1 zachMothership
+      enable = true;
+      # options = {
+      #    environment = lib.mkOption {
+      #      apply = opts: opts // { HOME=cfg.dataDir };
+      #      # apply = str: concatStrings [ str "\nHOME=cfg.dataDir"];
+      #    };
+      # };
+      # environment = {
+      #   HOME = "/var/lib/rabbitmq";
+      # };
+      # overrideRabbitServer = otherPkgs.rabbitmq_server;
+      overrideRabbitServer = customRabbitServer;
+      config = ''%% -*- mode: erlang -*-
+        %% https://raw.githubusercontent.com/rabbitmq/rabbitmq-server/stable/docs/rabbitmq.config.example
+        %% See http://www.rabbitmq.com/configure.html for details.
+        [
+         {rabbit,
+           [
+             {log_levels, [{connection, debug}, {channel, debug}]},
+             {loopback_users, []}
+             %% {heartbeat, 60	}
+           ]
+        %%    {rabbitmq_web_stomp,
+        %%       [{tcp_listeners, [{"127.0.0.1", 15674},
+        %%                                          {"::1",       15674}]}]
+        %%    }
+         },
+           {lager, [
+             {handlers, [
+               {lager_console_backend, debug}
+               ]}
+             ]}
+        ].'';
+      # plugins = [ "rabbitmq_web_stomp" "rabbitmq-web-dispatch" ];
+      plugins = [ "rabbitmq_web_stomp" "rabbitmq_management" "rabbitmq_tracing"];
+    };
+
+    upower.enable = true;
+
+    # dhcpd = {
+    #   enable = true;
+    #   # interfaces = "virtual0";
+    #   interfaces = "vboxnet0";
+    # };
+
+
+
+    # Enable the X11 windowing system.
+    # https://github.com/Ericson2314/nixos-configuration/blob/nixos/graphical.nix
+    xserver = {
+     enable = true;
+      layout = "us";
+      # xkbOptions = "esc:caps";
+      # videoDrivers=["nvidia"];
+
+      # disable touchpad hopefully
+      inputClassSections = [
+      ''
+        Identifier "evdev touchpad off"
+        MatchIsTouchpad "on"
+        MatchDevicePath "/dev/input/event*"
+        Driver "evdev"
+        Option "Ignore" "true"
+      ''
+      ];
+
+      # desktopManager = {
+      #   gnome3.enable = true;
+      #   default="gnome3";
+      # };
+      displayManager.lightdm.enable = true;
+
+      # Enable the KDE Desktop Environment.
+      # displayManager.sddm.enable = true;
+      # desktopManager.plasma5.enable = true;
+
+      # Enable the GNOME Desktop Environment.
+      # displayManager.gdm.enable = true;
+      # desktopManager.gnome3.enable = true;
+      # desktopManager.gnome3.default = "gnome3";
+
+      # Enable XMonad
+      windowManager.xmonad.enable = true;
+      windowManager.xmonad.enableContribAndExtras = true;
+      windowManager.xmonad.extraPackages = p: with p; [ taffybar ];
+      windowManager.default = "xmonad";
+      desktopManager.default = "none";
+    };
+  };
+
+  # Define a user account. Don't forget to set a password with ‘passwd’.
+  users ={
+    # extraGroups.vboxusers.members = [ "zach" ];
+    extraUsers = {
+      zach = {
+        isNormalUser = true;
+        uid = 1001;
+        extraGroups = [ "libvirtd" ];
+      };
+      guest = {
+        isNormalUser = true;
+        uid = 1000;
+      };
+    };
+  };
+
+
+ # temporary trouble dl'ing from binary cache
+  # virtualisation.libvirtd.enable = true;
+  # virtualisation.libvirtd.extraConfig = ''
+  #   user = "root"
+  #   group = "root"
+  # '';
+  # virtualisation.libvirtd.enableKVM= true;
+  # virtualisation.libvirtd.enable= true;
+
+  nixpkgs.config.allowUnfree = true;
+  # The NixOS release to be compatible with for stateful data such as databases.
+  system.stateVersion = "18.03";
+}
+  #+END_SRC
+   
+ 
+** nixops
+   ironically the part of nix I've contributed most to but also have the least practical experience with
+   (if you want to check it out, just check out the docs)
